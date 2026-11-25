@@ -5,11 +5,19 @@ Embedding: per-species centring -> PCA whitening (512) -> concat with an LDA pro
 Writes Work/Emb{fold}.pkl, Work/EmbTest.pkl, Work/CandsFold{f}.pkl, Work/CandsTest.pkl,
        SubmissionBaseline.csv
 Candidate table (one row per query x candidate identity) -- DON'T rename columns:
-  Query Identity CosMax Cos2nd Cos3 CosMean3 Knn10 SameSideMax IdRank QTop1 QGap12 NGal BestImgs
-  BestImgs = top TOP_IMG gallery ids of that identity by cosine (+ best same-flank image)
+  Query Identity CosMax Cos2nd Cos3 CosMean3 Knn10 SameSideMax OppSideMax OtherViewMax NSides
+  IdRank QTop1 QGap12 NGal BestImgs RawCosMax RawRank WCosMax WRank NCompGal
+  Candidates: the top TOP_ID - RAW_SLOTS identities in the main space, plus the RAW_SLOTS best
+  identities by raw MiewID cosine that are not already chosen.
+  (OppSideMax: best cosine among the animal's photos of the OTHER flank; OtherViewMax: among its
+   front/back/up/down photos; NSides: how many of L / R / other views the animal has in the gallery;
+   RawCosMax / RawRank and WCosMax / WRank: best-photo cosine and identity rank in the raw MiewID
+   space and in the whitened space without LDA -- the same comparison seen through other projections;
+   NCompGal: how many photos of the animal show the query's view, -1 if the query's view is unknown)
+  BestImgs = top TOP_IMG gallery ids of that identity by cosine (+ best same-flank image);
+             for the ALL_PHOTOS_TOP best identities: all their photos (up to ALL_PHOTOS_CAP)
 Allowed methods used: PCA, LDA as a projection, distance-based retrieval / k-NN.
-TODO:
-  [ ] k-reciprocal re-ranking, alpha query expansion
+Tried and not kept: identity-centroid matching, alpha query expansion, NCA, a left<->right flank map.
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -22,9 +30,12 @@ from Common import (NEW, WORK, LoadMeta, IdMaps, LoadMiewid, LoadFolds, Map5, Sa
                     WriteSubmission, Side)
 
 TOP_ID, TOP_IMG = 50, 3
+ALL_PHOTOS_TOP, ALL_PHOTOS_CAP = 3, 40  # for the 3 best candidates, SIFT-check (up to 40) of ALL their photos
+RAW_SLOTS = 10  # of the TOP_ID candidate slots, this many go to the best raw-cosine identities not already chosen
 N_PCA, N_LDA, LDA_MIX = 512, 128, 0.5
 CAND_COLS = ["Query", "Identity", "CosMax", "Cos2nd", "Cos3", "CosMean3", "Knn10", "SameSideMax",
-             "IdRank", "QTop1", "QGap12", "NGal", "BestImgs"]
+             "OppSideMax", "OtherViewMax", "NSides", "IdRank", "QTop1", "QGap12", "NGal", "BestImgs",
+             "RawCosMax", "RawRank", "WCosMax", "WRank", "NCompGal"]
 
 
 def Whiten(F, row, sp, nComp=N_PCA):
@@ -55,8 +66,10 @@ def AddLda(W, row, sp, lab, galleryIds, nComp=N_LDA, mix=LDA_MIX):
     return np.hstack([np.sqrt(1 - mix) * W, np.sqrt(mix) * L]).astype(np.float32)
 
 
-def Retrieve(E, row, sp, vp, queryIds, gallery):
-    """gallery: DataFrame(id, identity, species) -> candidate table"""
+def Retrieve(E, row, sp, vp, queryIds, gallery, extra=None):
+    """gallery: DataFrame(id, identity, species) -> candidate table.
+    extra: {"Raw": matrix, "W": matrix} other L2-normalised spaces scored for the same candidates."""
+    extra = extra or {}
     out = []
     for s, G in gallery.groupby("species"):
         qids = [q for q in queryIds if sp[q] == s]
@@ -74,19 +87,42 @@ def Retrieve(E, row, sp, vp, queryIds, gallery):
             qb = qids[b:b + 256]
             S = E[[row[q] for q in qb]] @ Ge.T
             M = np.maximum.reduceat(S, starts, axis=1)
+            XM, XR = {}, {}
+            for name, X in extra.items():  # per-identity best cosine + identity rank in other spaces
+                XM[name] = np.maximum.reduceat(X[[row[q] for q in qb]] @ X[[row[g] for g in gid]].T, starts, axis=1)
+                XR[name] = np.argsort(np.argsort(-XM[name], axis=1), axis=1)
             for r, q in enumerate(qb):
+                main = np.argsort(-M[r])
+                order = main[:TOP_ID - RAW_SLOTS] if RAW_SLOTS and "Raw" in XM else main[:TOP_ID]
+                if RAW_SLOTS and "Raw" in XM:
+                    chosen = set(order.tolist())
+                    rawExtra = [j for j in np.argsort(-XM["Raw"][r]) if j not in chosen][:RAW_SLOTS]
+                    order = np.r_[order, rawExtra].astype(int)
                 knn = np.bincount(seg[np.argsort(-S[r])[:10]], minlength=len(starts))
                 qs = Side(vp[q])
-                order = np.argsort(-M[r])[:TOP_ID]
-                top1 = M[r, order[0]]
-                top2 = M[r, order[1]] if len(order) > 1 else -1.0
+                top1 = M[r, main[0]]
+                top2 = M[r, main[1]] if len(main) > 1 else -1.0
                 for rk, j in enumerate(order):
                     a, n = starts[j], counts[j]
                     v = S[r, a:a + n]
                     o = np.argsort(-v)
-                    best = list(gid[a + o[:TOP_IMG]])
-                    same = np.flatnonzero(gside[a:a + n] == qs) if qs in "LR" else np.array([], int)
+                    best = list(gid[a + o[:(ALL_PHOTOS_CAP if rk < ALL_PHOTOS_TOP else TOP_IMG)]])
+                    gs = gside[a:a + n]
+                    same = np.flatnonzero(gs == qs) if qs in "LR" else np.array([], int)
                     ssm = float(v[same].max()) if len(same) else np.nan
+                    opp = np.flatnonzero(gs == {"L": "R", "R": "L"}.get(qs, "-"))
+                    oth = np.flatnonzero(gs == "O")
+                    osm = float(v[opp].max()) if len(opp) else np.nan
+                    ovm = float(v[oth].max()) if len(oth) else np.nan
+                    nsides = len(set(gs) - {"U"})
+                    # photos of this animal showing the SAME view as the query (same flank for L/R;
+                    # exactly the same label for front/back/up/down; unknown view -> -1)
+                    if qs in "LR":
+                        ncomp = int((gs == qs).sum())
+                    elif qs == "O":
+                        ncomp = int(sum(vp[g] == vp[q] for g in gid[a:a + n]))
+                    else:
+                        ncomp = -1
                     if len(same):
                         bs = gid[a + same[np.argmax(v[same])]]
                         if bs not in best:
@@ -94,8 +130,11 @@ def Retrieve(E, row, sp, vp, queryIds, gallery):
                     out.append((q, labs[j], float(v[o[0]]),
                                 float(v[o[1]]) if n > 1 else np.nan,
                                 float(v[o[2]]) if n > 2 else np.nan,
-                                float(v[o[:3]].mean()), int(knn[j]), ssm, rk,
-                                float(top1), float(top1 - top2), int(n), best))
+                                float(v[o[:3]].mean()), int(knn[j]), ssm, osm, ovm, nsides, rk,
+                                float(top1), float(top1 - top2), int(n), best,
+                                *(v for nm in ("Raw", "W") for v in
+                                  ((float(XM[nm][r, j]), int(XR[nm][r, j])) if nm in XM else (np.nan, -1))),
+                                ncomp))
     return pd.DataFrame(out, columns=CAND_COLS)
 
 
@@ -131,11 +170,12 @@ def Main():
     folds = LoadFolds()
     tr = train[["id", "identity", "species"]]
     W = Whiten(F, row, sp)
+    extra = {"Raw": F / np.linalg.norm(F, axis=1, keepdims=True), "W": W}
     cands = []
     for f in folds:
         E = AddLda(W, row, sp, lab, f["galleryIds"])
         SavePkl((E, row), f"Emb{f['fold']}.pkl")
-        c = Retrieve(E, row, sp, vp, f["queryIds"], tr[tr.id.isin(set(f["galleryIds"]))])
+        c = Retrieve(E, row, sp, vp, f["queryIds"], tr[tr.id.isin(set(f["galleryIds"]))], extra)
         c.to_pickle(WORK / f"CandsFold{f['fold']}.pkl")
         cands.append(c)
         print(f"fold {f['fold']} retrieved", flush=True)
@@ -146,7 +186,7 @@ def Main():
     print(f"baseline CV MAP@5 {m:.4f} (t={t:.3f}, pos={pos})  recall@{TOP_ID} {rec:.3f}")
     E = AddLda(W, row, sp, lab, train.id.tolist())
     SavePkl((E, row), "EmbTest.pkl")
-    ct = Retrieve(E, row, sp, vp, test.id.tolist(), tr)
+    ct = Retrieve(E, row, sp, vp, test.id.tolist(), tr, extra)
     ct.to_pickle(WORK / "CandsTest.pkl")
     WriteSubmission(BaselinePreds(PerQuery(ct), t, pos), test, train, "SubmissionBaseline.csv")
 
