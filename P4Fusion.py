@@ -106,3 +106,102 @@ def FinalPreds(prep, pNew, bias=0.0, normalise=True):
         preds[qk] = [allL[i] for i in np.argsort(-scores)[:5]]
     return preds
 
+
+def FitStage(V, idFeats, qBase, qFeats, lab):
+    """Out-of-fold identity probabilities + P(new) for the validation table V."""
+    y = (V.Identity == V.Truth).to_numpy(int)
+    V["P"] = Oof(V[idFeats], y, V["Query"].map(lab))
+    QV = QueryTable(V, qBase)
+    yNew = (V.groupby("QKey").Truth.first().loc[QV.index] == NEW).to_numpy(int)
+    pNew = pd.Series(Oof(QV[qFeats], yNew, QV.index.str.split(":").str[1].map(lab)), index=QV.index)
+    return y, QV, yNew, pNew
+
+
+def TuneMix(V, pNew, truths):
+    prep = Prepare(V)
+    best = (-1, None, None)
+    for norm in (True, False):
+        for bias in np.linspace(-2, 2, 9):
+            P = FinalPreds(prep, pNew, bias, norm)
+            best = max(best, (np.mean([Map5(t, P) for t in truths]), norm, bias))
+    return best
+
+
+def AddNeighbours(V, pNew, sets, sift):
+    """Stage-2 features, computed separately for each fold / the test set."""
+    out = []
+    for prefix, neigh in sets:
+        part = V[V.QKey.str.startswith(prefix)] if prefix else V
+        if len(part):
+            part = Stage2.NeighbourFeatures(part, pNew.to_dict(), neigh, prefix, sift)
+            part["NbrPMax"] = part.groupby("Query")["NbrP"].transform("max")
+            out.append(part)
+    return pd.concat(out).loc[V.index]
+
+
+def Main(newBias=None, stage2=True):
+    train, test = LoadMeta()
+    sp, vp, lab = IdMaps(train, test)
+    folds = LoadFolds()
+    sift = LoadPkl("SiftPairs.pkl", default={})
+    nkp = LoadPkl("Nkp.pkl", default={})
+    if not sift:
+        print("WARNING: no SIFT cache yet -> cosine-only fusion")
+    truths = [{f"{f['fold']}:{q}": t for q, t in f["truth"].items()} for f in folds]
+
+    parts = []
+    for f in folds:
+        c = AddFeatures(pd.read_pickle(WORK / f"CandsFold{f['fold']}.pkl"), sift, nkp, vp, sp)
+        c["QKey"] = f"{f['fold']}:" + c["Query"]
+        c["Truth"] = c["Query"].map(f["truth"])
+        parts.append(c)
+    V = pd.concat(parts, ignore_index=True)
+    ct = AddFeatures(pd.read_pickle(WORK / "CandsTest.pkl"), sift, nkp, vp, sp)
+    ct["QKey"] = ct["Query"]
+
+    # ---- stage 1 ----
+    y, QV, yNew, pNew = FitStage(V, ID_FEATS, Q_BASE, Q_FEATS, lab)
+    m, norm, bias = TuneMix(V, pNew, truths)
+    print(f"stage 1 CV MAP@5 {m:.4f}  (normalise={norm}, bias={bias:+.1f})", flush=True)
+    mId = lgb.LGBMClassifier(**PARAMS).fit(V[ID_FEATS], y)
+    ct["P"] = mId.predict_proba(ct[ID_FEATS])[:, 1]
+    QT = QueryTable(ct)
+    mNew = lgb.LGBMClassifier(**PARAMS).fit(QV[Q_FEATS], yNew)
+    pNewT = pd.Series(mNew.predict_proba(QT[Q_FEATS])[:, 1], index=QT.index)
+    idF, qB, qF = ID_FEATS, Q_BASE, Q_FEATS
+
+    # ---- stage 2: neighbouring queries ----
+    if stage2:
+        sets = Stage2.AllNeighbourSets(folds, test, sp)
+        V = AddNeighbours(V, pNew, sets[:-1], sift)
+        ct = AddNeighbours(ct, pNewT, sets[-1:], sift)
+        y, QV, yNew, pNew = FitStage(V, ID_FEATS2, Q_BASE2, Q_FEATS2, lab)
+        m2, norm2, bias2 = TuneMix(V, pNew, truths)
+        print(f"stage 2 CV MAP@5 {m2:.4f}  (normalise={norm2}, bias={bias2:+.1f})", flush=True)
+        if m2 > m:
+            m, norm, bias = m2, norm2, bias2
+            mId = lgb.LGBMClassifier(**PARAMS).fit(V[ID_FEATS2], y)
+            ct["P"] = mId.predict_proba(ct[ID_FEATS2])[:, 1]
+            QT = QueryTable(ct, Q_BASE2)
+            mNew = lgb.LGBMClassifier(**PARAMS).fit(QV[Q_FEATS2], yNew)
+            pNewT = pd.Series(mNew.predict_proba(QT[Q_FEATS2])[:, 1], index=QT.index)
+            idF = ID_FEATS2
+        else:
+            print("stage 2 did not help -> keeping stage 1")
+
+    print(f"final CV MAP@5 {m:.4f}")
+    if newBias is not None:
+        bias = newBias
+        print("using --NewBias", bias)
+    print("top identity-model features:\n",
+          pd.Series(mId.feature_importances_, idF).sort_values(ascending=False).head(10).to_string())
+    print(f"predicted new_individual rate on test: {(pNewT > 0.5).mean():.1%}")
+    WriteSubmission(FinalPreds(Prepare(ct), pNewT, bias, norm), test, train, "SubmissionFusion.csv")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--NewBias", type=float, default=None)
+    ap.add_argument("--NoStage2", action="store_true")
+    a = ap.parse_args()
+    Main(a.NewBias, not a.NoStage2)
