@@ -17,10 +17,35 @@ from Common import (NEW, WORK, DATA, LoadMeta, IdMaps, MakeFolds, SavePkl, LoadF
                     LoadPkl, Map5, CheckSubmission)
 
 
+ENC_TAU = 0.8     # photos of one animal with whitened cosine > ENC_TAU form one encounter
+UNK_FRAC = 0.2    # share of identities hidden per fold (controls the new_individual rate)
+
+
+def Encounters(train, tau=ENC_TAU):
+    """Graph clustering (connected components) of each identity's photos: photos linked when
+    their whitened MiewID cosine > tau, i.e. near-identical shots from the same burst."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    from Common import LoadMiewid
+    from P2Global import Whiten
+    sp, _, _ = IdMaps(train, train.iloc[:0])
+    F, row = LoadMiewid()
+    W = Whiten(F, row, {**sp, **dict(zip(LoadMeta()[1].id, LoadMeta()[1].species))})
+    enc = {}
+    for ident, g in train.groupby("identity"):
+        ids = g.id.tolist()
+        X = W[[row[i] for i in ids]]
+        _, comp = connected_components(csr_matrix(X @ X.T > tau), directed=False)
+        enc.update({i: f"{ident}#{c}" for i, c in zip(ids, comp)})
+    return enc
+
+
 def CmdFolds():
     train, test = LoadMeta()
     sp, _, _ = IdMaps(train, test)
-    folds = MakeFolds(train, nFolds=4)
+    enc = Encounters(train)
+    print(f"{len(set(enc.values()))} encounters among {len(train)} train photos")
+    folds = MakeFolds(train, nFolds=4, unkFrac=UNK_FRAC, enc=enc)
     SavePkl(folds, "Folds.pkl")
     for f in folds:
         t = pd.Series(f["truth"])
