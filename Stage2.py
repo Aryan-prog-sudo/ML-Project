@@ -24,10 +24,20 @@ def QueryNeighbours(E, row, qids, sp, k=K_NBR):
     return out
 
 
-def AllNeighbourSets(folds, test, sp):
-    """[(prefix, neighbours)] for every validation fold and for the test set."""
+def AllNeighbourSets(folds, test, sp, seed=0):
+    """[(prefix, neighbours)] for every validation fold and for the test set.
+    The test set has about twice as many queries as a validation fold, and neighbour features
+    depend on how many queries there are to search. So the test queries are split at random
+    into groups the size of a validation fold, and neighbours are searched within each group."""
     sets = [(f"{f['fold']}:", QueryNeighbours(*LoadPkl(f"Emb{f['fold']}.pkl"), f["queryIds"], sp)) for f in folds]
-    sets.append(("", QueryNeighbours(*LoadPkl("EmbTest.pkl"), test.id.tolist(), sp)))
+    foldSize = np.mean([len(f["queryIds"]) for f in folds])
+    ids = np.random.default_rng(seed).permutation(test.id.to_numpy())
+    nGroups = max(1, int(round(len(ids) / foldSize)))
+    E, row = LoadPkl("EmbTest.pkl")
+    neigh = {}
+    for g in np.array_split(ids, nGroups):
+        neigh.update(QueryNeighbours(E, row, list(g), sp))
+    sets.append(("", neigh))
     return sets
 
 

@@ -110,10 +110,13 @@ def Map5(truth, preds):
 
 
 # ---------------- validation folds ----------------
-def MakeFolds(train, nFolds=4, unkFrac=0.2, qFrac=0.25, cap=10, seed=42):
+def MakeFolds(train, nFolds=4, unkFrac=0.2, qFrac=0.25, cap=10, seed=42, enc=None):
     """Simulate the test set from train. Per fold: hide ~unkFrac of identities entirely
-    (their queries' truth = new_individual) and use ~qFrac of the other identities'
-    images as queries. Returns [{fold, queryIds, galleryIds, truth}]"""
+    (their queries' truth = new_individual) and use ~qFrac of the other identities' photos
+    as queries. If enc {id: encounter label} is given, whole ENCOUNTERS (bursts of
+    near-identical photos) are held out together, so a query never has a near-duplicate
+    left in the gallery -- this is what real test photos look like.
+    Returns [{fold, queryIds, galleryIds, truth}]"""
     rng = np.random.default_rng(seed)
     lab = dict(zip(train.id, train.identity))
     folds = []
@@ -127,9 +130,19 @@ def MakeFolds(train, nFolds=4, unkFrac=0.2, qFrac=0.25, cap=10, seed=42):
                 if ident in unk:
                     hidden.update(ids)
                     queries += list(rng.choice(ids, min(cap, len(ids)), replace=False))
-                elif len(ids) >= 2:
-                    k = min(cap, max(1, int(round(qFrac * len(ids)))), len(ids) - 1)
-                    queries += list(rng.choice(ids, k, replace=False))
+                elif enc is None:
+                    if len(ids) >= 2:
+                        k = min(cap, max(1, int(round(qFrac * len(ids)))), len(ids) - 1)
+                        queries += list(rng.choice(ids, k, replace=False))
+                else:
+                    encs = rng.permutation(np.asarray(sorted({enc[i] for i in ids}), dtype=object))
+                    if len(encs) < 2:
+                        continue  # a single encounter cannot give a realistic known query
+                    k = min(len(encs) - 1, max(1, int(round(qFrac * len(encs)))))
+                    qEnc = set(encs[:k])
+                    qi = [i for i in ids if enc[i] in qEnc]
+                    hidden.update(qi)  # the whole encounter leaves the gallery
+                    queries += list(rng.choice(qi, min(cap, len(qi)), replace=False))
         qset = set(queries)
         gallery = [i for i in train.id if i not in qset and i not in hidden]
         galIdents = {lab[i] for i in gallery}
